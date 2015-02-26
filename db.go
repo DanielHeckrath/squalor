@@ -19,6 +19,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	log "github.com/Sirupsen/logrus"
 	"reflect"
 	"sort"
 	"sync"
@@ -422,6 +423,7 @@ func (db *DB) Query(query interface{}, args ...interface{}) (*Rows, error) {
 	if err != nil {
 		return nil, err
 	}
+	log.WithField("query", querystr).Debug("Executing Query")
 	rows, err := db.DB.Query(querystr, args...)
 	if err != nil {
 		return nil, err
@@ -438,6 +440,7 @@ func (db *DB) QueryRow(query interface{}, args ...interface{}) *Row {
 	if err != nil {
 		return &Row{rows: Rows{Rows: nil, db: nil}, err: err}
 	}
+	log.WithField("query", querystr).Debug("Executing QueryRow")
 	rows, err := db.DB.Query(querystr, args...)
 	return &Row{rows: Rows{Rows: rows, db: db}, err: err}
 }
