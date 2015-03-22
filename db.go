@@ -77,6 +77,16 @@ func makeDeletePlan(m *Model) deletePlan {
 	return p
 }
 
+type selectPlan struct {
+	hooks selectHooks
+}
+
+func makeSelectPlan(m *Model) selectPlan {
+	p := selectPlan{}
+	p.hooks = selectHooks{}
+	return p
+}
+
 type getPlan struct {
 	selectBuilder *SelectBuilder
 	keyColumns    []ValExprBuilder
@@ -208,12 +218,13 @@ type Model struct {
 	// The mapping from column name to model object field info.
 	fields fieldMap
 	// The precomputed query plans.
-	delete  deletePlan
-	get     getPlan
-	insert  insertPlan
-	replace insertPlan
-	update  updatePlan
-	upsert  insertPlan
+	delete     deletePlan
+	get        getPlan
+	insert     insertPlan
+	replace    insertPlan
+	update     updatePlan
+	upsert     insertPlan
+	selectPlan selectPlan
 }
 
 func newModel(t reflect.Type, table Table) (*Model, error) {
@@ -223,6 +234,7 @@ func newModel(t reflect.Type, table Table) (*Model, error) {
 	}
 	m.delete = makeDeletePlan(m)
 	m.get = makeGetPlan(m)
+	m.selectPlan = makeSelectPlan(m)
 	m.insert = makeInsertPlan(m, false)
 	m.replace = makeInsertPlan(m, true)
 	m.update = makeUpdatePlan(m)
@@ -240,6 +252,10 @@ func getReplace(m *Model) insertPlan {
 
 func getUpsert(m *Model) insertPlan {
 	return m.upsert
+}
+
+func getSelect(m *Model) selectPlan {
+	return m.selectPlan
 }
 
 // DB is a wrapper around a sql.DB which also implements the
@@ -476,7 +492,7 @@ func (db *DB) Replace(list ...interface{}) error {
 // *[]*struct{} is allowed.  It is mildly more efficient to use
 // *[]struct{} due to the reduced use of reflection and allocation.
 func (db *DB) Select(dest interface{}, q interface{}, args ...interface{}) error {
-	return selectObjects(db, dest, q, args)
+	return selectObjects(db, db, dest, q, args)
 }
 
 // Update runs a SQL UPDATE statement for each element in list. List
@@ -612,7 +628,7 @@ func (tx *Tx) Replace(list ...interface{}) error {
 // *[]*struct{} is allowed.  It is mildly more efficient to use
 // *[]struct{} due to the reduced use of reflection and allocation.
 func (tx *Tx) Select(dest interface{}, q interface{}, args ...interface{}) error {
-	return selectObjects(tx, dest, q, args)
+	return selectObjects(tx.DB, tx, dest, q, args)
 }
 
 // Update runs a SQL UPDATE statement for each element in list. List
@@ -1162,7 +1178,7 @@ func insertObjects(db *DB, exec Executor, getPlan func(m *Model) insertPlan, lis
 	return nil
 }
 
-func selectObjects(exec Executor, dest interface{}, query interface{}, args []interface{}) error {
+func selectObjects(db *DB, exec Executor, dest interface{}, query interface{}, args []interface{}) error {
 	sliceValue := reflect.ValueOf(dest)
 	if sliceValue.Kind() != reflect.Ptr {
 		return fmt.Errorf("dest must be a pointer to a slice: %T", dest)
@@ -1177,6 +1193,11 @@ func selectObjects(exec Executor, dest interface{}, query interface{}, args []in
 	ptrResults := modelT.Kind() == reflect.Ptr
 	if ptrResults {
 		modelT = modelT.Elem()
+	}
+
+	model, err := db.getModel(modelT)
+	if err != nil {
+		return err
 	}
 
 	rows, err := exec.Query(query, args...)
@@ -1205,6 +1226,8 @@ func selectObjects(exec Executor, dest interface{}, query interface{}, args []in
 			// implicitly cloned.
 			result = rows.value
 		}
+
+		err = model.selectPlan.hooks.post(result.Interface(), exec)
 
 		sliceValue = reflect.Append(sliceValue, result)
 	}

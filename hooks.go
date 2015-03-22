@@ -19,6 +19,20 @@ type hooks interface {
 	post(obj interface{}, exec Executor) error
 }
 
+// PostSelect will be executed after the SELECT statement.
+type PostSelect interface {
+	PostSelect(Executor) error
+}
+
+type selectHooks struct{}
+
+func (selectHooks) post(obj interface{}, exec Executor) error {
+	if v, ok := obj.(PostSelect); ok {
+		return v.PostSelect(exec)
+	}
+	return nil
+}
+
 // PreDelete will be executed before the DELETE statement.
 type PreDelete interface {
 	PreDelete(Executor) error
