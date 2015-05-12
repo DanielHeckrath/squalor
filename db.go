@@ -19,10 +19,11 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	log "github.com/Sirupsen/logrus"
+	"io"
 	"reflect"
 	"sort"
 	"sync"
+	"time"
 )
 
 // ErrMixedAutoIncrIDs is returned when attempting to insert multiple
@@ -35,7 +36,7 @@ var ErrMixedAutoIncrIDs = errors.New("sql: auto increment column must be all set
 // DB or on a Tx.
 type Executor interface {
 	Delete(list ...interface{}) (int64, error)
-	Exec(string, ...interface{}) (sql.Result, error)
+	Exec(query interface{}, args ...interface{}) (sql.Result, error)
 	Get(dest interface{}, keys ...interface{}) error
 	Insert(list ...interface{}) error
 	Query(query interface{}, args ...interface{}) (*Rows, error)
@@ -96,12 +97,8 @@ type getPlan struct {
 
 func makeGetPlan(m *Model) getPlan {
 	p := getPlan{}
-	p.selectBuilder = m.Select(m.Table.All())
-	var columns []string
-	for _, col := range m.Columns {
-		columns = append(columns, col.Name)
-	}
-	p.traversals = m.fields.getTraversals(columns)
+	p.selectBuilder = m.selectAll()
+	p.traversals = m.fields.getTraversals(m.mappedColNames)
 
 	p.keyColumns = make([]ValExprBuilder, len(m.PrimaryKey.Columns))
 	for i, col := range m.PrimaryKey.Columns {
@@ -121,10 +118,8 @@ type insertPlan struct {
 
 func makeInsertPlan(m *Model, replace bool) insertPlan {
 	p := insertPlan{}
-	var colnames []string
 	var columns []interface{}
-	for _, col := range m.Columns {
-		colnames = append(colnames, col.Name)
+	for _, col := range m.mappedColumns {
 		columns = append(columns, m.Table.C(col.Name))
 		if col.AutoIncr {
 			f, ok := m.fields[col.Name]
@@ -150,7 +145,7 @@ func makeInsertPlan(m *Model, replace bool) insertPlan {
 		p.insertBuilder = m.Insert(columns...)
 		p.hooks = insertHooks{}
 	}
-	p.traversals = m.fields.getTraversals(colnames)
+	p.traversals = m.fields.getTraversals(m.mappedColNames)
 	return p
 }
 
@@ -164,7 +159,7 @@ func makeUpsertPlan(m *Model) insertPlan {
 	for _, col := range m.PrimaryKey.Columns {
 		primaryKey[col.Name] = true
 	}
-	for _, col := range m.Columns {
+	for _, col := range m.mappedColumns {
 		if col.AutoIncr || primaryKey[col.Name] {
 			continue
 		}
@@ -199,7 +194,7 @@ func makeUpdatePlan(m *Model) updatePlan {
 	p.whereTraversals = m.fields.getTraversals(whereColNames)
 
 	var setColumns []string
-	for _, col := range m.Columns {
+	for _, col := range m.mappedColumns {
 		if col.AutoIncr || primaryKey[col.Name] {
 			continue
 		}
@@ -215,8 +210,13 @@ func makeUpdatePlan(m *Model) updatePlan {
 type Model struct {
 	// The table the model is associated with.
 	Table
+	// The DB the model is associated with.
+	db *DB
 	// The mapping from column name to model object field info.
 	fields fieldMap
+	// All DB columns that are mapped in the model.
+	mappedColumns  []*Column
+	mappedColNames []string
 	// The precomputed query plans.
 	delete     deletePlan
 	get        getPlan
@@ -227,11 +227,14 @@ type Model struct {
 	selectPlan selectPlan
 }
 
-func newModel(t reflect.Type, table Table) (*Model, error) {
+func newModel(db *DB, t reflect.Type, table Table) (*Model, error) {
 	m := &Model{
+		db:     db,
 		Table:  table,
 		fields: getDBFields(t),
 	}
+	m.mappedColumns = m.fields.getMappedColumns(m.Columns, db.IgnoreUnmappedCols)
+	m.mappedColNames = getColumnNames(m.mappedColumns)
 	m.delete = makeDeletePlan(m)
 	m.get = makeGetPlan(m)
 	m.selectPlan = makeSelectPlan(m)
@@ -240,6 +243,18 @@ func newModel(t reflect.Type, table Table) (*Model, error) {
 	m.update = makeUpdatePlan(m)
 	m.upsert = makeUpsertPlan(m)
 	return m, nil
+}
+
+func (m *Model) selectAll() *SelectBuilder {
+	return m.Select(m.C(m.mappedColNames...))
+}
+
+func getColumnNames(columns []*Column) []string {
+	var colNames []string
+	for _, c := range columns {
+		colNames = append(colNames, c.Name)
+	}
+	return colNames
 }
 
 func getInsert(m *Model) insertPlan {
@@ -258,12 +273,29 @@ func getSelect(m *Model) selectPlan {
 	return m.selectPlan
 }
 
+// stringSerializer is a wrapper around a string that implements Serializer.
+type stringSerializer string
+
+func (ss stringSerializer) Serialize(w Writer) error {
+	_, err := io.WriteString(w, string(ss))
+	return err
+}
+
 // DB is a wrapper around a sql.DB which also implements the
 // squalor.Executor interface. DB is safe for concurrent use by
 // multiple goroutines.
 type DB struct {
 	*sql.DB
 	AllowStringQueries bool
+	// Whether to ignore unmapped columns for the various DB function calls such as StructScan,
+	// Select, Insert, BindModel, etc. When set to true, it can suppress column mapping validation
+	// errors at DB migration time when new columns are added but the previous version of the binary
+	// is still in use, either actively running or getting started up.
+	//
+	// The default is true that ignores the unmapped columns.
+	// NOTE: Unmapped columns in primary keys are still not allowed.
+	IgnoreUnmappedCols bool
+	Logger             QueryLogger
 	mu                 sync.RWMutex
 	models             map[reflect.Type]*Model
 	mappings           map[reflect.Type]fieldMap
@@ -274,9 +306,20 @@ func NewDB(db *sql.DB) *DB {
 	return &DB{
 		DB:                 db,
 		AllowStringQueries: true,
+		IgnoreUnmappedCols: true,
+		Logger:             nil,
 		models:             map[reflect.Type]*Model{},
 		mappings:           map[reflect.Type]fieldMap{},
 	}
+}
+
+func (db *DB) logQuery(query Serializer, exec Executor, start time.Time, err error) {
+	if db.Logger == nil {
+		return
+	}
+
+	executionTime := time.Now().Sub(start)
+	db.Logger.Log(query, exec, executionTime, err)
 }
 
 // GetModel retrieves the model for the specified object. Obj must be
@@ -316,19 +359,19 @@ func (db *DB) getMapping(t reflect.Type) fieldMap {
 	return mapping
 }
 
-func (db *DB) queryString(query interface{}) (string, error) {
+func (db *DB) getSerializer(query interface{}) (Serializer, error) {
 	if t, ok := query.(Serializer); ok {
-		return Serialize(t)
+		return t, nil
 	}
 
 	if db.AllowStringQueries {
 		switch t := query.(type) {
 		case string:
-			return t, nil
+			return stringSerializer(t), nil
 		}
 	}
 
-	return "", fmt.Errorf("unsupported query type %T", query)
+	return nil, fmt.Errorf("unsupported query type %T", query)
 }
 
 // BindModel binds the supplied interface with the named table. You
@@ -350,7 +393,11 @@ func (db *DB) BindModel(name string, obj interface{}) (*Model, error) {
 	if err != nil {
 		return nil, err
 	}
-	m, err = newModel(t, *table)
+	if table.PrimaryKey == nil {
+		return nil, fmt.Errorf("%s: table has no primary key", name)
+	}
+
+	m, err = newModel(db, t, *table)
 	if err != nil {
 		return nil, err
 	}
@@ -406,6 +453,25 @@ func (db *DB) Delete(list ...interface{}) (int64, error) {
 	return deleteObjects(db, db, list)
 }
 
+// Exec executes a query without returning any rows. The args are for any
+// placeholder parameters in the query.
+func (db *DB) Exec(query interface{}, args ...interface{}) (sql.Result, error) {
+	serializer, err := db.getSerializer(query)
+	if err != nil {
+		return nil, err
+	}
+	querystr, err := Serialize(serializer)
+	if err != nil {
+		return nil, err
+	}
+
+	start := time.Now()
+	result, err := db.DB.Exec(querystr, args...)
+	db.logQuery(serializer, db, start, err)
+
+	return result, err
+}
+
 // Get runs a SQL SELECT to fetch a single row. Keys must be the
 // primary keys defined for the table. The order must match the order
 // of the columns in the primary key.
@@ -435,12 +501,19 @@ func (db *DB) Insert(list ...interface{}) error {
 // small wrapper around sql.DB.Query that returns a *squalor.Rows
 // instead.
 func (db *DB) Query(query interface{}, args ...interface{}) (*Rows, error) {
-	querystr, err := db.queryString(query)
+	serializer, err := db.getSerializer(query)
 	if err != nil {
 		return nil, err
 	}
-	log.WithField("query", querystr).Debug("Executing Query")
+	querystr, err := Serialize(serializer)
+	if err != nil {
+		return nil, err
+	}
+
+	start := time.Now()
 	rows, err := db.DB.Query(querystr, args...)
+	db.logQuery(serializer, db, start, err)
+
 	if err != nil {
 		return nil, err
 	}
@@ -452,12 +525,19 @@ func (db *DB) Query(query interface{}, args ...interface{}) (*Rows, error) {
 // until Row's Scan method is called. This is a small wrapper around
 // sql.DB.QueryRow that returns a *squalor.Row instead.
 func (db *DB) QueryRow(query interface{}, args ...interface{}) *Row {
-	querystr, err := db.queryString(query)
+	serializer, err := db.getSerializer(query)
 	if err != nil {
 		return &Row{rows: Rows{Rows: nil, db: nil}, err: err}
 	}
-	log.WithField("query", querystr).Debug("Executing QueryRow")
+	querystr, err := Serialize(serializer)
+	if err != nil {
+		return &Row{rows: Rows{Rows: nil, db: nil}, err: err}
+	}
+
+	start := time.Now()
 	rows, err := db.DB.Query(querystr, args...)
+	db.logQuery(serializer, db, start, err)
+
 	return &Row{rows: Rows{Rows: rows, db: db}, err: err}
 }
 
@@ -532,6 +612,25 @@ type Tx struct {
 	DB *DB
 }
 
+// Exec executes a query that doesn't return rows. For example: an
+// INSERT and UPDATE.
+func (tx *Tx) Exec(query interface{}, args ...interface{}) (sql.Result, error) {
+	serializer, err := tx.DB.getSerializer(query)
+	if err != nil {
+		return nil, err
+	}
+	querystr, err := Serialize(serializer)
+	if err != nil {
+		return nil, err
+	}
+
+	start := time.Now()
+	result, err := tx.Tx.Exec(querystr, args...)
+	tx.DB.logQuery(serializer, tx, start, err)
+
+	return result, err
+}
+
 // Delete runs a batched SQL DELETE statement, grouping the objects by
 // the model type of the list elements. List elements must be pointers
 // to structs.
@@ -573,11 +672,19 @@ func (tx *Tx) Insert(list ...interface{}) error {
 // small wrapper around sql.Tx.Query that returns a *squalor.Rows
 // instead.
 func (tx *Tx) Query(query interface{}, args ...interface{}) (*Rows, error) {
-	querystr, err := tx.DB.queryString(query)
+	serializer, err := tx.DB.getSerializer(query)
 	if err != nil {
 		return nil, err
 	}
+	querystr, err := Serialize(serializer)
+	if err != nil {
+		return nil, err
+	}
+
+	start := time.Now()
 	rows, err := tx.Tx.Query(querystr, args...)
+	tx.DB.logQuery(serializer, tx, start, err)
+
 	if err != nil {
 		return nil, err
 	}
@@ -589,11 +696,19 @@ func (tx *Tx) Query(query interface{}, args ...interface{}) (*Rows, error) {
 // until Row's Scan method is called. This is a small wrapper around
 // sql.Tx.QueryRow that returns a *squalor.Row instead.
 func (tx *Tx) QueryRow(query interface{}, args ...interface{}) *Row {
-	querystr, err := tx.DB.queryString(query)
+	serializer, err := tx.DB.getSerializer(query)
 	if err != nil {
 		return &Row{rows: Rows{Rows: nil, db: nil}, err: err}
 	}
+	querystr, err := Serialize(serializer)
+	if err != nil {
+		return &Row{rows: Rows{Rows: nil, db: nil}, err: err}
+	}
+
+	start := time.Now()
 	rows, err := tx.Tx.Query(querystr, args...)
+	tx.DB.logQuery(serializer, tx, start, err)
+
 	return &Row{rows: Rows{Rows: rows, db: tx.DB}, err: err}
 }
 
@@ -695,7 +810,6 @@ func (r *Rows) initScan(t reflect.Type) error {
 		r.dest = []interface{}{ptr.Interface()}
 	} else {
 		m := r.db.getMapping(t)
-
 		// Fetch the column names in the result.
 		cols, err := r.Rows.Columns()
 		if err != nil {
@@ -710,7 +824,11 @@ func (r *Rows) initScan(t reflect.Type) error {
 		for i, col := range cols {
 			field, ok := m[col]
 			if !ok {
-				return fmt.Errorf("unable to find mapping for column '%s'", col)
+				if !r.db.IgnoreUnmappedCols {
+					return fmt.Errorf("unable to find mapping for column '%s'", col)
+				}
+				r.dest[i] = new(sql.RawBytes)
+				continue
 			}
 			r.dest[i] = r.value.FieldByIndex(field.Index).Addr().Interface()
 		}
@@ -936,7 +1054,7 @@ func deleteModel(model *Model, exec Executor, list []interface{}) (int64, error)
 	// the AND and IN expression. The buffers are the max size to
 	// minimize reallocations, though it is possible we'll only use a
 	// handful of values in the same batch.
-	valbuf := make([]encodedVal, len(rows)+n-1)
+	valbuf := make([]EncodedVal, len(rows)+n-1)
 	argbuf := make(ValExprs, 0, len(rows))
 	var inTuple ValTuple
 	inTuple.Exprs = argbuf
@@ -979,12 +1097,7 @@ func deleteModel(model *Model, exec Executor, list []interface{}) (int64, error)
 				b.Where(andExpr.And(inExpr))
 			}
 
-			s, err := Serialize(&b)
-			if err != nil {
-				return -1, err
-			}
-
-			res, err := exec.Exec(s)
+			res, err := exec.Exec(&b)
 			if err != nil {
 				return -1, err
 			}
@@ -1058,18 +1171,13 @@ func getObject(db *DB, exec Executor, obj interface{}, keys []interface{}) error
 	}
 	q.Where(where)
 
-	s, err := Serialize(&q)
-	if err != nil {
-		return err
-	}
-
 	v := reflect.Indirect(reflect.ValueOf(obj))
 	dest := make([]interface{}, len(model.get.traversals))
 	for i, traversal := range model.get.traversals {
 		dest[i] = v.FieldByIndex(traversal).Addr().Interface()
 	}
 
-	if err := exec.QueryRow(s).Scan(dest...); err != nil {
+	if err := exec.QueryRow(&q).Scan(dest...); err != nil {
 		return err
 	}
 
@@ -1118,22 +1226,18 @@ func insertModel(model *Model, exec Executor, getPlan func(m *Model) insertPlan,
 		return ErrMixedAutoIncrIDs
 	}
 
-	var s string
-	var err error
+	var serializer Serializer
 	if plan.replaceBuilder != nil {
 		b := *plan.replaceBuilder
 		b.AddRows(rows)
-		s, err = Serialize(&b)
+		serializer = &b
 	} else {
 		b := *plan.insertBuilder
 		b.AddRows(rows)
-		s, err = Serialize(&b)
-	}
-	if err != nil {
-		return err
+		serializer = &b
 	}
 
-	res, err := exec.Exec(s)
+	res, err := exec.Exec(serializer)
 	if err != nil {
 		return err
 	}
@@ -1168,7 +1272,6 @@ func insertObjects(db *DB, exec Executor, getPlan func(m *Model) insertPlan, lis
 	if err != nil {
 		return err
 	}
-
 	for model, list := range objs {
 		err := insertModel(model, exec, getPlan, list)
 		if err != nil {
@@ -1264,11 +1367,7 @@ func updateModel(model *Model, exec Executor, list []interface{}) (int64, error)
 		}
 		b.Where(where)
 
-		s, err := Serialize(b)
-		if err != nil {
-			return -1, err
-		}
-		res, err := exec.Exec(s)
+		res, err := exec.Exec(b)
 		if err != nil {
 			return -1, err
 		}

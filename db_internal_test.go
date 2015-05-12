@@ -56,7 +56,7 @@ func newTestStatementsDB(t *testing.T) *DB {
 			Columns: table.Columns[:len(table.Columns)-1],
 		}
 		modelT := reflect.TypeOf(d.model)
-		m, err := newModel(modelT, *table)
+		m, err := newModel(db, modelT, *table)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -83,11 +83,28 @@ type recordingExecutor struct {
 	query []string
 }
 
-func (r *recordingExecutor) Exec(stmt string, args ...interface{}) (sql.Result, error) {
+func (r *recordingExecutor) Exec(stmt interface{}, args ...interface{}) (sql.Result, error) {
+	var querystr string
+	var err error
+
+	switch t := stmt.(type) {
+	case string:
+		querystr = t
+		return r.Exec(t, args...)
+	case Serializer:
+		querystr, err = Serialize(t)
+		if err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unexpected stmt type")
+	}
+
 	if len(args) != 0 {
 		panic(fmt.Errorf("expected 0 args: %+v", args))
 	}
-	r.exec = append(r.exec, stmt)
+
+	r.exec = append(r.exec, querystr)
 	return dummyResult{}, nil
 }
 
@@ -95,7 +112,17 @@ func (r *recordingExecutor) QueryRow(query interface{}, args ...interface{}) *Ro
 	if len(args) != 0 {
 		panic(fmt.Errorf("expected 0 args: %+v", args))
 	}
-	r.query = append(r.query, query.(string))
+
+	if s, ok := query.(string); ok {
+		r.query = append(r.query, s)
+	} else if serializer, ok := query.(Serializer); ok {
+		s, err := Serialize(serializer)
+		if err != nil {
+			return &Row{err: err}
+		}
+		r.query = append(r.query, s)
+	}
+
 	return &Row{err: fmt.Errorf("ignored")}
 }
 
@@ -120,18 +147,18 @@ func TestDBDeleteStatements(t *testing.T) {
 		},
 		{[]interface{}{&multiCol{1, 2, 3, 4}},
 			[]string{
-				"DELETE FROM `multi` WHERE ((`multi`.`a` = 1) AND `multi`.`b` = 2) AND `multi`.`c` IN (3)",
+				"DELETE FROM `multi` WHERE (`multi`.`a` = 1 AND `multi`.`b` = 2 AND `multi`.`c` IN (3))",
 			},
 		},
 		{[]interface{}{&multiCol{1, 2, 3, 4}, &multiCol{1, 2, 4, 5}},
 			[]string{
-				"DELETE FROM `multi` WHERE ((`multi`.`a` = 1) AND `multi`.`b` = 2) AND `multi`.`c` IN (3, 4)",
+				"DELETE FROM `multi` WHERE (`multi`.`a` = 1 AND `multi`.`b` = 2 AND `multi`.`c` IN (3, 4))",
 			},
 		},
 		{[]interface{}{&multiCol{1, 2, 3, 4}, &multiCol{1, 3, 4, 5}},
 			[]string{
-				"DELETE FROM `multi` WHERE ((`multi`.`a` = 1) AND `multi`.`b` = 2) AND `multi`.`c` IN (3)",
-				"DELETE FROM `multi` WHERE ((`multi`.`a` = 1) AND `multi`.`b` = 3) AND `multi`.`c` IN (4)",
+				"DELETE FROM `multi` WHERE (`multi`.`a` = 1 AND `multi`.`b` = 2 AND `multi`.`c` IN (3))",
+				"DELETE FROM `multi` WHERE (`multi`.`a` = 1 AND `multi`.`b` = 3 AND `multi`.`c` IN (4))",
 			},
 		},
 	}
@@ -166,7 +193,7 @@ func TestDBGetStatements(t *testing.T) {
 		},
 		{&multiCol{}, []interface{}{1, 2, 3},
 			"SELECT `multi`.`a`, `multi`.`b`, `multi`.`c`, `multi`.`d` " +
-				"FROM `multi` WHERE ((`multi`.`a` = 1) AND `multi`.`b` = 2) AND `multi`.`c` = 3",
+				"FROM `multi` WHERE (`multi`.`a` = 1 AND `multi`.`b` = 2 AND `multi`.`c` = 3)",
 		},
 	}
 
@@ -283,15 +310,15 @@ func TestDBUpdateStatements(t *testing.T) {
 		{[]interface{}{&multiCol{1, 2, 3, 4}},
 			[]string{
 				"UPDATE `multi` SET `multi`.`d` = 4 " +
-					"WHERE ((`multi`.`a` = 1) AND `multi`.`b` = 2) AND `multi`.`c` = 3",
+					"WHERE (`multi`.`a` = 1 AND `multi`.`b` = 2 AND `multi`.`c` = 3)",
 			},
 		},
 		{[]interface{}{&multiCol{1, 2, 3, 4}, &multiCol{5, 6, 7, 8}},
 			[]string{
 				"UPDATE `multi` SET `multi`.`d` = 4 " +
-					"WHERE ((`multi`.`a` = 1) AND `multi`.`b` = 2) AND `multi`.`c` = 3",
+					"WHERE (`multi`.`a` = 1 AND `multi`.`b` = 2 AND `multi`.`c` = 3)",
 				"UPDATE `multi` SET `multi`.`d` = 8 " +
-					"WHERE ((`multi`.`a` = 5) AND `multi`.`b` = 6) AND `multi`.`c` = 7",
+					"WHERE (`multi`.`a` = 5 AND `multi`.`b` = 6 AND `multi`.`c` = 7)",
 			},
 		},
 	}

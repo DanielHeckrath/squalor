@@ -345,11 +345,13 @@ func TestSelectBuilder(t *testing.T) {
 		{users.Select("*").Where(foo.Eq("bar").Not()),
 			"SELECT * FROM `users` WHERE NOT (`users`.`foo` = 'bar')"},
 		{users.Select("*").Where(foo.Eq("bar").And(bar.Lt(2))),
-			"SELECT * FROM `users` WHERE (`users`.`foo` = 'bar') AND `users`.`bar` < 2"},
+			"SELECT * FROM `users` WHERE (`users`.`foo` = 'bar' AND `users`.`bar` < 2)"},
 		{users.Select("*").Where(foo.Eq("bar").Or(bar.Lte(2))),
-			"SELECT * FROM `users` WHERE (`users`.`foo` = 'bar') OR `users`.`bar` <= 2"},
+			"SELECT * FROM `users` WHERE (`users`.`foo` = 'bar' OR `users`.`bar` <= 2)"},
 		{users.Select("*").Where(foo.Eq("bar").And(bar.Gt(2)).Or(qux.Eq(false))),
-			"SELECT * FROM `users` WHERE ((`users`.`foo` = 'bar') AND `users`.`bar` > 2) OR `users`.`qux` = 0"},
+			"SELECT * FROM `users` WHERE ((`users`.`foo` = 'bar' AND `users`.`bar` > 2) OR `users`.`qux` = 0)"},
+		{users.Select("*").Where(foo.Eq("bar").And(bar.Eq("baz")).And(qux.IsNull().Or(qux.Gt(5)))),
+			"SELECT * FROM `users` WHERE (`users`.`foo` = 'bar' AND `users`.`bar` = 'baz' AND (`users`.`qux` IS NULL OR `users`.`qux` > 5))"},
 		// GroupBy
 		{users.Select(foo).Where(foo.Eq("bar")).GroupBy(bar),
 			"SELECT `users`.`foo` FROM `users` WHERE `users`.`foo` = 'bar' GROUP BY `users`.`bar`"},
@@ -432,6 +434,52 @@ func TestSelectBuilder(t *testing.T) {
 
 	for _, c := range testCases {
 		if sql, err := Serialize(c.builder); err != nil {
+			t.Errorf("Expected success, but found %s\n%s", err, c.expected)
+		} else if c.expected != sql {
+			t.Errorf("Expected\n%s\nbut got\n%s", c.expected, sql)
+		}
+	}
+}
+
+func TestSerializeWithPlaceholders(t *testing.T) {
+	type User struct {
+		Foo, Bar, Qux string
+	}
+	users := NewTable("users", User{})
+	foo := users.C("foo")
+
+	type Object struct {
+		Foo, Baz string
+	}
+
+	testCases := []struct {
+		builder  *SelectBuilder
+		expected string
+	}{
+		{users.Select(foo.As("bar")),
+			"SELECT `users`.`foo` AS `bar` FROM `users`"},
+		{users.Select("*").Where(foo.Eq(1)),
+			"SELECT * FROM `users` WHERE `users`.`foo` = ?"},
+		{users.Select("*").Where(foo.Neq(false)),
+			"SELECT * FROM `users` WHERE `users`.`foo` != ?"},
+		{users.Select("*").Where(foo.NullSafeEq(false)),
+			"SELECT * FROM `users` WHERE `users`.`foo` <=> ?"},
+		{users.Select("*").Where(foo.Gte(time.Time{})),
+			"SELECT * FROM `users` WHERE `users`.`foo` >= ?"},
+		{users.Select("*").Where(foo.Lt(2.5)),
+			"SELECT * FROM `users` WHERE `users`.`foo` < ?"},
+		{users.Select("*").Where(foo.Lt(true)),
+			"SELECT * FROM `users` WHERE `users`.`foo` < ?"},
+		{users.Select("*").Where(foo.IsNull()),
+			"SELECT * FROM `users` WHERE `users`.`foo` IS NULL"},
+		{users.Select(foo).Where(foo.In([]string{"baz", "qux"})),
+			"SELECT `users`.`foo` FROM `users` WHERE `users`.`foo` IN (?, ?)"},
+		{users.Select(foo).Where(foo.Like("baz")),
+			"SELECT `users`.`foo` FROM `users` WHERE `users`.`foo` LIKE ?"},
+	}
+
+	for _, c := range testCases {
+		if sql, err := SerializeWithPlaceholders(c.builder); err != nil {
 			t.Errorf("Expected success, but found %s\n%s", err, c.expected)
 		} else if c.expected != sql {
 			t.Errorf("Expected\n%s\nbut got\n%s", c.expected, sql)

@@ -18,6 +18,7 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/coopernurse/gorp"
@@ -25,11 +26,36 @@ import (
 
 const objectsDDL = `
 CREATE TABLE objects (
-  user_id     BIGINT    NOT NULL,
+  user_id     BIGINT         NOT NULL,
   object_id   VARBINARY(767) NOT NULL,
   value       BLOB           NULL,
   timestamp   BIGINT         NULL,
   PRIMARY KEY (user_id, object_id),
+  INDEX (user_id, timestamp)
+)`
+
+const objectsDDLWithUnmappedColumns = `
+CREATE TABLE objects (
+  user_id     BIGINT         NOT NULL,
+  object_id   VARBINARY(767) NOT NULL,
+  value       BLOB           NULL,
+  timestamp   BIGINT         NULL,
+  unmapped    VARBINARY(767) NULL,
+  PRIMARY KEY (user_id, object_id),
+  INDEX (user_id, timestamp)
+)`
+
+const objectsDDLAddUnmappedColumns = `
+ALTER TABLE objects ADD COLUMN (
+  unmapped VARBINARY(767) NULL
+)`
+
+const objectsDDLWithoutPrimaryKey = `
+CREATE TABLE objects (
+  user_id     BIGINT         NOT NULL,
+  object_id   VARBINARY(767) NOT NULL,
+  value       BLOB           NULL,
+  timestamp   BIGINT         NULL,
   INDEX (user_id, timestamp)
 )`
 
@@ -39,10 +65,21 @@ CREATE TABLE users (
   name VARCHAR(255) NOT NULL
 )`
 
-func TestDB(t *testing.T) {
+func TestDB_WithoutUnmappedColumns(t *testing.T) {
 	db := makeTestDB(t, objectsDDL)
 	defer db.Close()
 
+	testDB(db, t)
+}
+
+func TestDB_WithUnmappedColumnsIgnored(t *testing.T) {
+	db := makeTestDB(t, objectsDDLWithUnmappedColumns)
+	defer db.Close()
+
+	testDB(db, t)
+}
+
+func testDB(db *DB, t *testing.T) {
 	type BaseModel struct {
 		UserID    int64  `db:"user_id"`
 		ID        string `db:"object_id"`
@@ -593,6 +630,96 @@ func TestDBAllowStringQueries(t *testing.T) {
 	// String queries should fail.
 	if err := db.Select(&results, "SELECT * FROM item"); err == nil {
 		t.Fatalf("Expected error, but found success")
+	}
+}
+
+func TestBindModel_FailUnknownColumns(t *testing.T) {
+	db := makeTestDB(t, objectsDDLWithUnmappedColumns)
+	db.IgnoreUnmappedCols = false
+	defer db.Close()
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatalf("Expected to recover an error")
+		}
+		str := "field 'unmapped' has no mapping"
+		if !strings.Contains(r.(error).Error(), str) {
+			t.Fatalf("Expected error to contain \"%s\", but got \"%s\"", str, r)
+		}
+	}()
+
+	db.BindModel("objects", Object{})
+	t.Fatal("Expected panic. Should not reach here")
+}
+
+func TestBindModel_FailNoPrimaryKey(t *testing.T) {
+	db := makeTestDB(t, objectsDDLWithoutPrimaryKey)
+	defer db.Close()
+
+	_, err := db.BindModel("objects", Object{})
+	str := "objects: table has no primary key"
+	if err == nil {
+		t.Fatalf("Expected missing primary key error, but got nil")
+	} else if err.Error() != str {
+		t.Fatalf("Unexpected error `%s`, expected `%s`", err, str)
+	}
+}
+
+func TestSelect_FailOnUnknownColumns(t *testing.T) {
+	db := makeTestDB(t, objectsDDL)
+	db.IgnoreUnmappedCols = false
+	defer db.Close()
+
+	items, err := db.BindModel("objects", Object{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	i := &Object{UserID: 1, ID: "bar", Value: "hello world"}
+	if err := db.Insert(i); err != nil {
+		t.Fatal(err)
+	}
+
+	db.Exec(objectsDDLAddUnmappedColumns)
+
+	var results []Object
+	err = db.Select(&results, items.Select("*"))
+	if err == nil {
+		t.Fatalf("Expected error, but got %+v", results)
+	}
+	str := "unable to find mapping for column 'unmapped'"
+	if !strings.Contains(err.Error(), str) {
+		t.Fatalf("Expected error to contain \"%s\", but got \"%s\"", str, err)
+	}
+}
+
+func TestStructScan_FailOnUnknownColumns(t *testing.T) {
+	db := makeTestDB(t, objectsDDL)
+	db.IgnoreUnmappedCols = false
+	defer db.Close()
+
+	items, err := db.BindModel("objects", Object{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	i := &Object{UserID: 1, ID: "bar", Value: "hello world"}
+	if err := db.Insert(i); err != nil {
+		t.Fatal(err)
+	}
+
+	db.Exec(objectsDDLAddUnmappedColumns)
+
+	j := &Object{}
+	q := items.Select("*").Where(items.C("user_id").Eq(1))
+	err = db.QueryRow(q).StructScan(j)
+	if err == nil {
+		t.Fatal("Expected error, but got %+v", j)
+	}
+	str := "unable to find mapping for column 'unmapped'"
+	if !strings.Contains(err.Error(), str) {
+		t.Fatalf("Expected error to contain \"%s\", but got \"%s\"", str, err)
 	}
 }
 
